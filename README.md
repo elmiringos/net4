@@ -1,1 +1,1 @@
-# NET4: disributed inference with Rust
+# NET4: distributed inference with Rust
