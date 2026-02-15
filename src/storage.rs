@@ -1,6 +1,5 @@
-use rocksdb::{DB, Options, ColumnFamilyDescriptor};
+use sled::Db;
 use thiserror::Error;
-use std::sync::Arc;
 use crate::types::{Address, InferenceRequest, NodeProfile, NodeStatus};
 
 #[derive(Debug, Error)]
@@ -15,128 +14,86 @@ pub enum StorageError {
     Serialize(String),
 }
 
-const CF_NODES: &str = "nodes";
-const CF_REQUESTS: &str = "requests";
-const CF_META: &str = "meta";
+fn sled_err(e: sled::Error) -> StorageError {
+    StorageError::Read(e.to_string())
+}
+
+fn ser_err(e: serde_json::Error) -> StorageError {
+    StorageError::Serialize(e.to_string())
+}
 
 #[derive(Clone)]
 pub struct Storage {
-    db: Arc<DB>,
+    db: Db,
+    nodes: sled::Tree,
+    statuses: sled::Tree,
+    requests: sled::Tree,
+    meta: sled::Tree,
 }
 
 impl Storage {
     pub fn open(path: &str) -> Result<Self, StorageError> {
-        let mut opts = Options::default();
-        opts.create_if_missing(true);
-        opts.create_missing_column_families(true);
+        let db: Db = sled::open(path).map_err(|e| StorageError::Open(e.to_string()))?;
 
-        let cfs = vec![
-            ColumnFamilyDescriptor::new(CF_NODES, Options::default()),
-            ColumnFamilyDescriptor::new(CF_REQUESTS, Options::default()),
-            ColumnFamilyDescriptor::new(CF_META, Options::default()),
-        ];
+        let nodes = db.open_tree("nodes").map_err(sled_err)?;
+        let statuses = db.open_tree("statuses").map_err(sled_err)?;
+        let requests = db.open_tree("requests").map_err(sled_err)?;
+        let meta = db.open_tree("meta").map_err(sled_err)?;
 
-        let db = DB::open_cf_descriptors(&opts, path, cfs).map_err(|e| StorageError::Open(e.to_string()))?;
-        let arc_db = Arc::new(db);
-
-        Ok(Self { db: arc_db } )
+        Ok(Self { db, nodes, statuses, requests, meta })
     }
 
     pub fn put_node_profile(&self, address: &Address, profile: &NodeProfile) -> Result<(), StorageError> {
-        let cf = self.db.cf_handle(CF_NODES)
-            .ok_or(StorageError::Read("nodes cf not found".to_string()))?;
-
-        let key = address.as_bytes();
-        let value = serde_json::to_vec(profile)
-            .map_err(|e| StorageError::Serialize(e.to_string()))?;
-
-        self.db.put_cf(&cf, key, value)
-            .map_err(|e| StorageError::Write(e.to_string()))?;
-
+        let value = serde_json::to_vec(profile).map_err(ser_err)?;
+        self.nodes.insert(address.as_bytes(), value).map_err(sled_err)?;
         Ok(())
     }
 
     pub fn get_node_profile(&self, address: &Address) -> Result<Option<NodeProfile>, StorageError> {
-        let cf = self.db.cf_handle(CF_NODES)
-            .ok_or(StorageError::Read("nodes cf not found".to_string()))?;
-
-        let key = address.as_bytes();
-
-        match self.db.get_cf(&cf, key).map_err(|e| StorageError::Read(e.to_string()))? {
-            Some(bytes) => {
-                let profile = serde_json::from_slice(&bytes)
-                    .map_err(|e| StorageError::Serialize(e.to_string()))?;
-                Ok(Some(profile))
-            }
+        match self.nodes.get(address.as_bytes()).map_err(sled_err)? {
+            Some(bytes) => Ok(Some(serde_json::from_slice(&bytes).map_err(ser_err)?)),
             None => Ok(None),
         }
     }
 
     pub fn put_request(&self, request: &InferenceRequest) -> Result<(), StorageError> {
-        let cf = self.db.cf_handle(CF_REQUESTS)
-            .ok_or(StorageError::Read("requests cf not found".to_string()))?;
-        let key = request.request_id.as_bytes();
-        let value = serde_json::to_vec(request)
-            .map_err(|e| StorageError::Serialize(e.to_string()))?;
-        self.db.put_cf(&cf, key, value)
-            .map_err(|e| StorageError::Write(e.to_string()))?;
+        let value = serde_json::to_vec(request).map_err(ser_err)?;
+        self.requests.insert(request.request_id.as_bytes(), value).map_err(sled_err)?;
         Ok(())
     }
 
     pub fn get_request(&self, request_id: &str) -> Result<Option<InferenceRequest>, StorageError> {
-        let cf = self.db.cf_handle(CF_REQUESTS)
-            .ok_or(StorageError::Read("requests cf not found".to_string()))?;
-        let key = request_id.as_bytes();
-        match self.db.get_cf(&cf, key).map_err(|e| StorageError::Read(e.to_string()))? {
-            Some(bytes) => {
-                let request = serde_json::from_slice(&bytes)
-                    .map_err(|e| StorageError::Serialize(e.to_string()))?;
-                Ok(Some(request))
-            }
+        match self.requests.get(request_id.as_bytes()).map_err(sled_err)? {
+            Some(bytes) => Ok(Some(serde_json::from_slice(&bytes).map_err(ser_err)?)),
             None => Ok(None),
         }
     }
 
     pub fn put_node_status(&self, address: &Address, status: &NodeStatus) -> Result<(), StorageError> {
-            let cf = self.db.cf_handle(CF_NODES)
-                .ok_or(StorageError::Read("nodes cf not found".to_string()))?;
-            // Different key prefix so it doesn't overwrite the profile
-            let mut key = Vec::from(b"status:" as &[u8]);
-            key.extend_from_slice(address.as_bytes());
-            let value = serde_json::to_vec(status)
-                .map_err(|e| StorageError::Serialize(e.to_string()))?;
-            self.db.put_cf(&cf, key, value)
-                .map_err(|e| StorageError::Write(e.to_string()))?;
-            Ok(())
-        }
+        let value = serde_json::to_vec(status).map_err(ser_err)?;
+        self.statuses.insert(address.as_bytes(), value).map_err(sled_err)?;
+        Ok(())
+    }
 
     pub fn get_node_status(&self, address: &Address) -> Result<Option<NodeStatus>, StorageError> {
-        let cf = self.db.cf_handle(CF_NODES)
-            .ok_or(StorageError::Read("nodes cf not found".to_string()))?;
-        let mut key = Vec::from(b"status:" as &[u8]);
-        key.extend_from_slice(address.as_bytes());
-        match self.db.get_cf(&cf, key).map_err(|e| StorageError::Read(e.to_string()))? {
-            Some(bytes) => {
-                let status = serde_json::from_slice(&bytes)
-                    .map_err(|e| StorageError::Serialize(e.to_string()))?;
-                Ok(Some(status))
-            }
+        match self.statuses.get(address.as_bytes()).map_err(sled_err)? {
+            Some(bytes) => Ok(Some(serde_json::from_slice(&bytes).map_err(ser_err)?)),
             None => Ok(None),
         }
     }
 
+    pub fn flush(&self) -> Result<(), StorageError> {
+        self.db.flush().map_err(sled_err)?;
+        Ok(())
+    }
+
     pub fn set_meta(&self, key: &str, value: &str) -> Result<(), StorageError> {
-        let cf = self.db.cf_handle(CF_META)
-            .ok_or(StorageError::Read("meta cf not found".to_string()))?;
-        self.db.put_cf(&cf, key.as_bytes(), value.as_bytes())
-            .map_err(|e| StorageError::Write(e.to_string()))?;
+        self.meta.insert(key.as_bytes(), value.as_bytes()).map_err(sled_err)?;
         Ok(())
     }
 
     pub fn get_meta(&self, key: &str) -> Result<Option<String>, StorageError> {
-        let cf = self.db.cf_handle(CF_META)
-            .ok_or(StorageError::Read("meta cf not found".to_string()))?;
-        match self.db.get_cf(&cf, key.as_bytes()).map_err(|e| StorageError::Read(e.to_string()))? {
+        match self.meta.get(key.as_bytes()).map_err(sled_err)? {
             Some(bytes) => Ok(Some(String::from_utf8_lossy(&bytes).to_string())),
             None => Ok(None),
         }

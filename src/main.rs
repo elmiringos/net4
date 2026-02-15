@@ -1,11 +1,6 @@
-mod types;
-mod identity;
-mod node;
-mod storage;
-
-use types::{Address, ModelInfo, NodeProfile};
-use identity::NodeIdentity;
-use storage::Storage;
+use net4::types::{ModelInfo, NodeProfile};
+use net4::identity::{self, NodeIdentity};
+use net4::storage::Storage;
 
 fn main() {
     println!("=== net4 stack test ===\n");
